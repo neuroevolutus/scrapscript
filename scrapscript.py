@@ -107,12 +107,6 @@ class RightBracket(Token):
 
 
 @dataclass(eq=True)
-class Juxt(Token):
-    # The space between other tokens that indicates function application.
-    pass
-
-
-@dataclass(eq=True)
 class VariantToken(Token):
     value: str
 
@@ -517,7 +511,6 @@ def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
             # TODO: revisit whether to use @ or . for field access
             l = Access(l, parse(tokens, pr))
         else:
-            assert not isinstance(op, Juxt)
             assert isinstance(op, Operator)
             l = Binop(BinopKind.from_str(op.value), l, parse(tokens, pr))
     return l
