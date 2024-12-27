@@ -351,7 +351,7 @@ class UnexpectedEOFError(ParseError):
 
 
 def parse_assign(tokens: typing.List[Token], p: float = 0) -> "Assign":
-    assign = parse(tokens, p)
+    assign = parse_binary(tokens, p)
     if isinstance(assign, Spread):
         return Assign(Var("..."), assign)
     if not isinstance(assign, Assign):
@@ -371,18 +371,18 @@ def gensym_reset() -> None:
 gensym_reset()
 
 
-def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
+def parse_unary(tokens: typing.List[Token], p: float) -> "Object":
     if not tokens:
         raise UnexpectedEOFError("unexpected end of input")
     token = tokens.pop(0)
     l: Object
     if isinstance(token, IntLit):
-        l = Int(token.value)
+        return Int(token.value)
     elif isinstance(token, FloatLit):
-        l = Float(token.value)
+        return Float(token.value)
     elif isinstance(token, Name):
         # TODO: Handle kebab case vars
-        l = Var(token.value)
+        return Var(token.value)
     elif isinstance(token, VariantToken):
         # It needs to be higher than the precedence of the -> operator so that
         # we can match variants in MatchFunction
@@ -390,7 +390,7 @@ def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
         # we can use #true() and #false() in boolean expressions
         # It needs to be higher than the precedence of juxtaposition so that
         # f #true() #false() is parsed as f(TRUE)(FALSE)
-        l = Variant(token.value, parse(tokens, PS[""].pr + 1))
+        return Variant(token.value, parse_binary(tokens, PS[""].pr + 1))
     elif isinstance(token, BytesLit):
         base = token.base
         if base == 85:
@@ -403,45 +403,48 @@ def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
             l = Bytes(base64.b16decode(token.value))
         else:
             raise ParseError(f"unexpected base {base!r} in {token!r}")
+        return l
     elif isinstance(token, StringLit):
-        l = String(token.value)
+        return String(token.value)
     elif token == Operator("..."):
         if tokens and isinstance(tokens[0], Name):
             name = tokens[0].value
             tokens.pop(0)
-            l = Spread(name)
+            return Spread(name)
         else:
-            l = Spread()
+            return Spread()
     elif token == Operator("|"):
-        expr = parse(tokens, PS["|"].pr)  # TODO: make this work for larger arities
+        expr = parse_binary(tokens, PS["|"].pr)  # TODO: make this work for larger arities
         if not isinstance(expr, Function):
             raise ParseError(f"expected function in match expression {expr!r}")
         cases = [MatchCase(expr.arg, expr.body)]
         while tokens and tokens[0] == Operator("|"):
             tokens.pop(0)
-            expr = parse(tokens, PS["|"].pr)  # TODO: make this work for larger arities
+            expr = parse_binary(tokens, PS["|"].pr)  # TODO: make this work for larger arities
             if not isinstance(expr, Function):
                 raise ParseError(f"expected function in match expression {expr!r}")
             cases.append(MatchCase(expr.arg, expr.body))
-        l = MatchFunction(cases)
+        return MatchFunction(cases)
     elif isinstance(token, LeftParen):
         if isinstance(tokens[0], RightParen):
             l = Hole()
         else:
             l = parse(tokens)
         tokens.pop(0)
+        return l
     elif isinstance(token, LeftBracket):
         l = List([])
         token = tokens[0]
         if isinstance(token, RightBracket):
             tokens.pop(0)
         else:
-            l.items.append(parse(tokens, 2))
+            l.items.append(parse_binary(tokens, 2))
             while not isinstance(tokens.pop(0), RightBracket):
                 if isinstance(l.items[-1], Spread):
                     raise ParseError("spread must come at end of list match")
                 # TODO: Implement .. operator
-                l.items.append(parse(tokens, 2))
+                l.items.append(parse_binary(tokens, 2))
+        return l
     elif isinstance(token, LeftBrace):
         l = Record({})
         token = tokens[0]
@@ -456,17 +459,21 @@ def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
                 # TODO: Implement .. operator
                 assign = parse_assign(tokens, 2)
                 l.data[assign.name.name] = assign.value
+        return l
     elif token == Operator("-"):
         # Unary minus
         # Precedence was chosen to be higher than binary ops so that -a op
         # b is (-a) op b and not -(a op b).
         # Precedence was chosen to be higher than function application so that
         # -a b is (-a) b and not -(a b).
-        r = parse(tokens, HIGHEST_PREC + 1)
-        l = Binop(BinopKind.SUB, Int(0), r)
+        r = parse_binary(tokens, HIGHEST_PREC + 1)
+        return Binop(BinopKind.SUB, Int(0), r)
     else:
         raise ParseError(f"unexpected token {token!r}")
 
+
+def parse_binary(tokens: typing.List[Token], p: float) -> "Object":
+    l: Object = parse_unary(tokens, p)
     while True:
         if not tokens:
             break
@@ -478,7 +485,7 @@ def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
             pl, pr = prec.pl, prec.pr
             if pl < p:
                 break
-            l = Apply(l, parse(tokens, pr))
+            l = Apply(l, parse_binary(tokens, pr))
             continue
         prec = PS[op.value]
         pl, pr = prec.pl, prec.pr
@@ -488,32 +495,36 @@ def parse(tokens: typing.List[Token], p: float = 0) -> "Object":
         if op == Operator("="):
             if not isinstance(l, Var):
                 raise ParseError(f"expected variable in assignment {l!r}")
-            l = Assign(l, parse(tokens, pr))
+            l = Assign(l, parse_binary(tokens, pr))
         elif op == Operator("->"):
-            l = Function(l, parse(tokens, pr))
+            l = Function(l, parse_binary(tokens, pr))
         elif op == Operator("|>"):
-            l = Apply(parse(tokens, pr), l)
+            l = Apply(parse_binary(tokens, pr), l)
         elif op == Operator("<|"):
-            l = Apply(l, parse(tokens, pr))
+            l = Apply(l, parse_binary(tokens, pr))
         elif op == Operator(">>"):
-            r = parse(tokens, pr)
+            r = parse_binary(tokens, pr)
             varname = gensym()
             l = Function(Var(varname), Apply(r, Apply(l, Var(varname))))
         elif op == Operator("<<"):
-            r = parse(tokens, pr)
+            r = parse_binary(tokens, pr)
             varname = gensym()
             l = Function(Var(varname), Apply(l, Apply(r, Var(varname))))
         elif op == Operator("."):
-            l = Where(l, parse(tokens, pr))
+            l = Where(l, parse_binary(tokens, pr))
         elif op == Operator("?"):
-            l = Assert(l, parse(tokens, pr))
+            l = Assert(l, parse_binary(tokens, pr))
         elif op == Operator("@"):
             # TODO: revisit whether to use @ or . for field access
-            l = Access(l, parse(tokens, pr))
+            l = Access(l, parse_binary(tokens, pr))
         else:
             assert isinstance(op, Operator)
-            l = Binop(BinopKind.from_str(op.value), l, parse(tokens, pr))
+            l = Binop(BinopKind.from_str(op.value), l, parse_binary(tokens, pr))
     return l
+
+
+def parse(tokens: typing.List[Token]) -> "Object":
+    return parse_binary(tokens, 0)
 
 
 @dataclass(eq=True, frozen=True, unsafe_hash=True)
