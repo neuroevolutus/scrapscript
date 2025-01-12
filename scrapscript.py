@@ -34,9 +34,22 @@ def is_identifier_char(c: str) -> bool:
     return c.isalnum() or c in ("$", "'", "_")
 
 
+@dataclass(eq=True, unsafe_hash=True)
+class SourceLocation:
+    lineno: int = dataclasses.field(default=-1)
+    colno: int = dataclasses.field(default=-1)
+    byteno: int = dataclasses.field(default=-1)
+
+
+@dataclass(eq=True, unsafe_hash=True)
+class SourceExtent:
+    start: SourceLocation = dataclasses.field(default_factory=SourceLocation)
+    end: SourceLocation = dataclasses.field(default_factory=SourceLocation)
+
+
 @dataclass(eq=True)
 class Token:
-    lineno: int = dataclasses.field(default=-1, init=False, compare=False)
+    source_extent: SourceExtent = dataclasses.field(default_factory=SourceExtent, init=False, compare=False)
 
 
 @dataclass(eq=True)
@@ -107,8 +120,9 @@ class RightBracket(Token):
 
 
 @dataclass(eq=True)
-class VariantToken(Token):
-    value: str
+class Hash(Token):
+    # #
+    pass
 
 
 @dataclass(eq=True)
@@ -116,27 +130,72 @@ class EOF(Token):
     pass
 
 
+def num_bytes_as_utf8(s: str) -> int:
+    return len(s.encode(encoding="UTF-8"))
+
+
 class Lexer:
     def __init__(self, text: str):
         self.text: str = text
         self.idx: int = 0
-        self.lineno: int = 1
-        self.colno: int = 1
+        self._lineno: int = 1
+        self._colno: int = 1
         self.line: str = ""
+        self._byteno: int = 0
+        self.current_token_source_extent: SourceExtent = SourceExtent(
+            start=SourceLocation(
+                lineno=self._lineno,
+                colno=self._colno,
+                byteno=self._byteno,
+            ),
+            end=SourceLocation(
+                lineno=self._lineno,
+                colno=self._colno,
+                byteno=self._byteno,
+            ),
+        )
+        self.token_start_idx: int = self.idx
+        self.token_end_idx: int = self.token_start_idx
+
+    @property
+    def lineno(self) -> int:
+        return self._lineno
+
+    @property
+    def colno(self) -> int:
+        return self._colno
+
+    @property
+    def byteno(self) -> int:
+        return self._byteno
+
+    def mark_token_start(self) -> None:
+        self.current_token_source_extent.start.lineno = self._lineno
+        self.current_token_source_extent.start.colno = self._colno
+        self.current_token_source_extent.start.byteno = self._byteno
+        self.token_start_idx = self.idx
+
+    def mark_token_end(self) -> None:
+        self.current_token_source_extent.end.lineno = self._lineno
+        self.current_token_source_extent.end.colno = self._colno
+        self.current_token_source_extent.end.byteno = self._byteno
+        self.token_end_idx = self.idx
 
     def has_input(self) -> bool:
         return self.idx < len(self.text)
 
     def read_char(self) -> str:
+        self.mark_token_end()
         c = self.peek_char()
         if c == "\n":
-            self.lineno += 1
-            self.colno = 1
+            self._lineno += 1
+            self._colno = 1
             self.line = ""
         else:
             self.line += c
-            self.colno += 1
+            self._colno += 1
         self.idx += 1
+        self._byteno += num_bytes_as_utf8(c)
         return c
 
     def peek_char(self) -> str:
@@ -146,11 +205,24 @@ class Lexer:
 
     def make_token(self, cls: type, *args: Any) -> Token:
         result: Token = cls(*args)
-        result.lineno = self.lineno
+
+        # Set start of token's source extent
+        result.source_extent.start.lineno = self.current_token_source_extent.start.lineno
+        result.source_extent.start.colno = self.current_token_source_extent.start.colno
+        result.source_extent.start.byteno = self.current_token_source_extent.start.byteno
+
+        # Set end of token's source extent
+        result.source_extent.end.colno = self.current_token_source_extent.end.colno
+        result.source_extent.end.lineno = self.current_token_source_extent.end.lineno
+        result.source_extent.end.byteno = self.current_token_source_extent.end.byteno
+
         return result
 
-    def read_one(self) -> Token:
+    def read_token(self) -> Token:
+        # Consume all whitespace
         while self.has_input():
+            # Keep updating the token start location until we exhaust all whitespace
+            self.mark_token_start()
             c = self.read_char()
             if not c.isspace():
                 break
@@ -161,15 +233,11 @@ class Lexer:
         if c == "-":
             if self.has_input() and self.peek_char() == "-":
                 self.read_comment()
-                return self.read_one()
+                # Need to start reading a new token
+                return self.read_token()
             return self.read_op(c)
         if c == "#":
-            value = self.read_one()
-            if isinstance(value, EOF):
-                raise UnexpectedEOFError("while reading symbol")
-            if not isinstance(value, Name):
-                raise ParseError(f"expected name after #, got {value!r}")
-            return self.make_token(VariantToken, value.value)
+            return self.make_token(Hash)
         if c == "~":
             if self.has_input() and self.peek_char() == "~":
                 self.read_char()
@@ -191,7 +259,20 @@ class Lexer:
             return self.read_op(c)
         if is_identifier_char(c):
             return self.read_var(c)
-        raise ParseError(f"unexpected token {c!r}", ("<input>", self.lineno, self.colno, self.line))
+        raise InvalidTokenError(
+            SourceExtent(
+                start=SourceLocation(
+                    lineno=self.current_token_source_extent.start.lineno,
+                    colno=self.current_token_source_extent.start.colno,
+                    byteno=self.current_token_source_extent.start.byteno,
+                ),
+                end=SourceLocation(
+                    lineno=self.current_token_source_extent.end.lineno,
+                    colno=self.current_token_source_extent.end.colno,
+                    byteno=self.current_token_source_extent.end.byteno,
+                ),
+            )
+        )
 
     def read_string(self) -> Token:
         buf = ""
@@ -252,9 +333,9 @@ class Lexer:
     def read_bytes(self) -> Token:
         buf = ""
         while self.has_input():
-            if (c := self.read_char()).isspace():
+            if self.peek_char().isspace():
                 break
-            buf += c
+            buf += self.read_char()
         base, _, value = buf.rpartition("'")
         return self.make_token(BytesLit, value, int(base) if base else 64)
 
@@ -262,7 +343,7 @@ class Lexer:
 def tokenize(x: str) -> typing.List[Token]:
     lexer = Lexer(x)
     tokens = []
-    while (token := lexer.read_one()) and not isinstance(token, EOF):
+    while (token := lexer.read_token()) and not isinstance(token, EOF):
         tokens.append(token)
     return tokens
 
@@ -341,8 +422,22 @@ OPER_CHARS = set("".join(PS.keys()))
 assert " " not in OPER_CHARS
 
 
-class ParseError(SyntaxError):
+class SyntacticError(Exception):
     pass
+
+
+class ParseError(SyntacticError):
+    pass
+
+
+@dataclass(eq=True, frozen=True, unsafe_hash=True)
+class UnexpectedTokenError(ParseError):
+    unexpected_token: Token
+
+
+@dataclass(eq=True, frozen=True, unsafe_hash=True)
+class InvalidTokenError(ParseError):
+    unexpected_token: SourceExtent = dataclasses.field(default_factory=SourceExtent, compare=False)
 
 
 # TODO(max): Replace with EOFError?
@@ -383,14 +478,20 @@ def parse_unary(tokens: typing.List[Token], p: float) -> "Object":
     elif isinstance(token, Name):
         # TODO: Handle kebab case vars
         return Var(token.value)
-    elif isinstance(token, VariantToken):
-        # It needs to be higher than the precedence of the -> operator so that
-        # we can match variants in MatchFunction
-        # It needs to be higher than the precedence of the && operator so that
-        # we can use #true() and #false() in boolean expressions
-        # It needs to be higher than the precedence of juxtaposition so that
-        # f #true() #false() is parsed as f(TRUE)(FALSE)
-        return Variant(token.value, parse_binary(tokens, PS[""].pr + 1))
+    elif isinstance(token, Hash):
+        if tokens and isinstance(variant := tokens[0], Name):
+            tokens.pop(0)
+            # It needs to be higher than the precedence of the -> operator so that
+            # we can match variants in MatchFunction
+            # It needs to be higher than the precedence of the && operator so that
+            # we can use #true() and #false() in boolean expressions
+            # It needs to be higher than the precedence of juxtaposition so that
+            # f #true() #false() is parsed as f(TRUE)(FALSE)
+            return Variant(variant.value, parse_binary(tokens, PS[""].pr + 1))
+        elif tokens:
+            raise UnexpectedTokenError(variant)
+        else:
+            raise UnexpectedEOFError("unexpected end of input")
     elif isinstance(token, BytesLit):
         base = token.base
         if base == 85:
@@ -475,7 +576,7 @@ def parse_unary(tokens: typing.List[Token], p: float) -> "Object":
             return Float(-r.value)
         return Binop(BinopKind.SUB, Int(0), r)
     else:
-        raise ParseError(f"unexpected token {token!r}")
+        raise UnexpectedTokenError(token)
 
 
 def parse_binary(tokens: typing.List[Token], p: float) -> "Object":
@@ -1741,6 +1842,15 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(l.lineno, 2)
         self.assertEqual(l.colno, 1)
 
+    def test_read_char_increments_byteno(self) -> None:
+        l = Lexer("abc")
+        l.read_char()
+        self.assertEqual(l.byteno, 1)
+        l.read_char()
+        self.assertEqual(l.byteno, 2)
+        l.read_char()
+        self.assertEqual(l.byteno, 3)
+
     def test_read_char_appends_to_line(self) -> None:
         l = Lexer("ab\nc")
         l.read_char()
@@ -1749,16 +1859,171 @@ class TokenizerTests(unittest.TestCase):
         l.read_char()
         self.assertEqual(l.line, "")
 
-    def test_read_one_sets_lineno(self) -> None:
+    def test_read_token_sets_start_and_end_linenos(self) -> None:
         l = Lexer("a b \n c d")
-        a = l.read_one()
-        b = l.read_one()
-        c = l.read_one()
-        d = l.read_one()
-        self.assertEqual(a.lineno, 1)
-        self.assertEqual(b.lineno, 1)
-        self.assertEqual(c.lineno, 2)
-        self.assertEqual(d.lineno, 2)
+        a = l.read_token()
+        b = l.read_token()
+        c = l.read_token()
+        d = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+
+        self.assertEqual(b.source_extent.start.lineno, 1)
+        self.assertEqual(b.source_extent.end.lineno, 1)
+
+        self.assertEqual(c.source_extent.start.lineno, 2)
+        self.assertEqual(c.source_extent.end.lineno, 2)
+
+        self.assertEqual(d.source_extent.start.lineno, 2)
+        self.assertEqual(d.source_extent.end.lineno, 2)
+
+    def test_read_token_sets_source_extents_for_variables(self) -> None:
+        l = Lexer("aa bbbb \n ccccc ddddddd")
+
+        a = l.read_token()
+        b = l.read_token()
+        c = l.read_token()
+        d = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+        self.assertEqual(a.source_extent.start.colno, 1)
+        self.assertEqual(a.source_extent.end.colno, 2)
+        self.assertEqual(a.source_extent.start.byteno, 0)
+        self.assertEqual(a.source_extent.end.byteno, 1)
+
+        self.assertEqual(b.source_extent.start.lineno, 1)
+        self.assertEqual(b.source_extent.end.lineno, 1)
+        self.assertEqual(b.source_extent.start.colno, 4)
+        self.assertEqual(b.source_extent.end.colno, 7)
+        self.assertEqual(b.source_extent.start.byteno, 3)
+        self.assertEqual(b.source_extent.end.byteno, 6)
+
+        self.assertEqual(c.source_extent.start.lineno, 2)
+        self.assertEqual(c.source_extent.end.lineno, 2)
+        self.assertEqual(c.source_extent.start.colno, 2)
+        self.assertEqual(c.source_extent.end.colno, 6)
+        self.assertEqual(c.source_extent.start.byteno, 10)
+        self.assertEqual(c.source_extent.end.byteno, 14)
+
+        self.assertEqual(d.source_extent.start.lineno, 2)
+        self.assertEqual(d.source_extent.end.lineno, 2)
+        self.assertEqual(d.source_extent.start.colno, 8)
+        self.assertEqual(d.source_extent.end.colno, 14)
+        self.assertEqual(d.source_extent.start.byteno, 16)
+        self.assertEqual(d.source_extent.end.byteno, 22)
+
+    def test_read_token_correctly_sets_source_extents_for_variants(self) -> None:
+        l = Lexer("# \n\r\n\t abc")
+
+        a = l.read_token()
+        b = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+        self.assertEqual(a.source_extent.start.colno, 1)
+        # TODO(max): Should tabs count as one column?
+        self.assertEqual(a.source_extent.end.colno, 1)
+
+        self.assertEqual(b.source_extent.start.lineno, 3)
+        self.assertEqual(b.source_extent.end.lineno, 3)
+        self.assertEqual(b.source_extent.start.colno, 3)
+        self.assertEqual(b.source_extent.end.colno, 5)
+
+    def test_read_token_correctly_sets_source_extents_for_strings(self) -> None:
+        l = Lexer('"今日は、Maxさん。"')
+        a = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+
+        self.assertEqual(a.source_extent.start.colno, 1)
+        self.assertEqual(a.source_extent.end.colno, 12)
+
+        self.assertEqual(a.source_extent.start.byteno, 0)
+        self.assertEqual(a.source_extent.end.byteno, 25)
+
+    def test_read_token_correctly_sets_source_extents_for_byte_literals(self) -> None:
+        l = Lexer("~~QUJD ~~85'K|(_ ~~64'QUJD\n ~~32'IFBEG=== ~~16'414243")
+        a = l.read_token()
+        b = l.read_token()
+        c = l.read_token()
+        d = l.read_token()
+        e = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+        self.assertEqual(a.source_extent.start.colno, 1)
+        self.assertEqual(a.source_extent.end.colno, 6)
+        self.assertEqual(a.source_extent.start.byteno, 0)
+        self.assertEqual(a.source_extent.end.byteno, 5)
+
+        self.assertEqual(b.source_extent.start.lineno, 1)
+        self.assertEqual(b.source_extent.end.lineno, 1)
+        self.assertEqual(b.source_extent.start.colno, 8)
+        self.assertEqual(b.source_extent.end.colno, 16)
+        self.assertEqual(b.source_extent.start.byteno, 7)
+        self.assertEqual(b.source_extent.end.byteno, 15)
+
+        self.assertEqual(c.source_extent.start.lineno, 1)
+        self.assertEqual(c.source_extent.end.lineno, 1)
+        self.assertEqual(c.source_extent.start.colno, 18)
+        self.assertEqual(c.source_extent.end.colno, 26)
+        self.assertEqual(c.source_extent.start.byteno, 17)
+        self.assertEqual(c.source_extent.end.byteno, 25)
+
+        self.assertEqual(d.source_extent.start.lineno, 2)
+        self.assertEqual(d.source_extent.end.lineno, 2)
+        self.assertEqual(d.source_extent.start.colno, 2)
+        self.assertEqual(d.source_extent.end.colno, 14)
+        self.assertEqual(d.source_extent.start.byteno, 28)
+        self.assertEqual(d.source_extent.end.byteno, 40)
+
+        self.assertEqual(e.source_extent.start.lineno, 2)
+        self.assertEqual(e.source_extent.end.lineno, 2)
+        self.assertEqual(e.source_extent.start.colno, 16)
+        self.assertEqual(e.source_extent.end.colno, 26)
+        self.assertEqual(e.source_extent.start.byteno, 42)
+        self.assertEqual(e.source_extent.end.byteno, 52)
+
+    def test_read_token_correctly_sets_source_extents_for_numbers(self) -> None:
+        l = Lexer("123 123.456")
+        a = l.read_token()
+        b = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+        self.assertEqual(a.source_extent.start.colno, 1)
+        self.assertEqual(a.source_extent.end.colno, 3)
+        self.assertEqual(a.source_extent.start.byteno, 0)
+        self.assertEqual(a.source_extent.end.byteno, 2)
+
+        self.assertEqual(b.source_extent.start.lineno, 1)
+        self.assertEqual(b.source_extent.end.lineno, 1)
+        self.assertEqual(b.source_extent.start.colno, 5)
+        self.assertEqual(b.source_extent.end.colno, 11)
+        self.assertEqual(b.source_extent.start.byteno, 4)
+        self.assertEqual(b.source_extent.end.byteno, 10)
+
+    def test_read_token_correctly_sets_source_extents_for_operators(self) -> None:
+        l = Lexer("> >>")
+        a = l.read_token()
+        b = l.read_token()
+
+        self.assertEqual(a.source_extent.start.lineno, 1)
+        self.assertEqual(a.source_extent.end.lineno, 1)
+        self.assertEqual(a.source_extent.start.colno, 1)
+        self.assertEqual(a.source_extent.end.colno, 1)
+        self.assertEqual(a.source_extent.start.byteno, 0)
+        self.assertEqual(a.source_extent.end.byteno, 0)
+
+        self.assertEqual(b.source_extent.start.lineno, 1)
+        self.assertEqual(b.source_extent.end.lineno, 1)
+        self.assertEqual(b.source_extent.start.colno, 3)
+        self.assertEqual(b.source_extent.end.colno, 4)
+        self.assertEqual(b.source_extent.start.byteno, 2)
+        self.assertEqual(b.source_extent.end.byteno, 3)
 
     def test_tokenize_list_with_only_spread(self) -> None:
         self.assertEqual(tokenize("[ ... ]"), [LeftBracket(), Operator("..."), RightBracket()])
@@ -1838,19 +2103,11 @@ class TokenizerTests(unittest.TestCase):
             ],
         )
 
-    def test_tokenize_variant_with_space(self) -> None:
-        self.assertEqual(tokenize("# abc"), [VariantToken("abc")])
+    def test_tokenize_variant_with_whitespace(self) -> None:
+        self.assertEqual(tokenize("# \n\r\n\t abc"), [Hash(), Name("abc")])
 
     def test_tokenize_variant_with_no_space(self) -> None:
-        self.assertEqual(tokenize("#abc"), [VariantToken("abc")])
-
-    def test_tokenize_variant_non_name_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, "expected name"):
-            tokenize("#1")
-
-    def test_tokenize_variant_eof_raises_unexpected_eof_error(self) -> None:
-        with self.assertRaisesRegex(UnexpectedEOFError, "while reading symbol"):
-            tokenize("#")
+        self.assertEqual(tokenize("#abc"), [Hash(), Name("abc")])
 
 
 class ParserTests(unittest.TestCase):
@@ -2007,16 +2264,22 @@ class ParserTests(unittest.TestCase):
         )
 
     def test_parse_list_with_only_comma_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, re.escape("unexpected token Operator(lineno=-1, value=',')")):
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
             parse([LeftBracket(), Operator(","), RightBracket()])
 
+        self.assertEqual(parse_error.exception.unexpected_token, Operator(","))
+
     def test_parse_list_with_two_commas_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, re.escape("unexpected token Operator(lineno=-1, value=',')")):
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
             parse([LeftBracket(), Operator(","), Operator(","), RightBracket()])
 
+        self.assertEqual(parse_error.exception.unexpected_token, Operator(","))
+
     def test_parse_list_with_trailing_comma_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, re.escape("unexpected token RightBracket(lineno=-1)")):
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
             parse([LeftBracket(), IntLit(1), Operator(","), RightBracket()])
+
+        self.assertEqual(parse_error.exception.unexpected_token, RightBracket())
 
     def test_parse_assign(self) -> None:
         self.assertEqual(
@@ -2308,19 +2571,35 @@ class ParserTests(unittest.TestCase):
             )
 
     def test_parse_record_with_only_comma_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, re.escape("unexpected token Operator(lineno=-1, value=',')")):
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
             parse([LeftBrace(), Operator(","), RightBrace()])
 
+        self.assertEqual(parse_error.exception.unexpected_token, Operator(","))
+
     def test_parse_record_with_two_commas_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, re.escape("unexpected token Operator(lineno=-1, value=',')")):
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
             parse([LeftBrace(), Operator(","), Operator(","), RightBrace()])
 
+        self.assertEqual(parse_error.exception.unexpected_token, Operator(","))
+
     def test_parse_record_with_trailing_comma_raises_parse_error(self) -> None:
-        with self.assertRaisesRegex(ParseError, re.escape("unexpected token RightBrace(lineno=-1)")):
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
             parse([LeftBrace(), Name("x"), Operator("="), IntLit(1), Operator(","), RightBrace()])
 
+        self.assertEqual(parse_error.exception.unexpected_token, RightBrace())
+
     def test_parse_variant_returns_variant(self) -> None:
-        self.assertEqual(parse([VariantToken("abc"), IntLit(1)]), Variant("abc", Int(1)))
+        self.assertEqual(parse([Hash(), Name("abc"), IntLit(1)]), Variant("abc", Int(1)))
+
+    def test_parse_variant_non_name_raises_parse_error(self) -> None:
+        with self.assertRaises(UnexpectedTokenError) as parse_error:
+            parse([Hash(), IntLit(1)])
+
+        self.assertEqual(parse_error.exception.unexpected_token, IntLit(1))
+
+    def test_parse_variant_eof_raises_unexpected_eof_error(self) -> None:
+        with self.assertRaises(UnexpectedEOFError):
+            parse([Hash()])
 
     def test_match_with_variant(self) -> None:
         ast = parse(tokenize("| #true () -> 123"))
